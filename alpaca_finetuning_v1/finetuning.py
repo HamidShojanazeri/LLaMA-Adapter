@@ -16,8 +16,32 @@ from engine_finetuning import train_one_epoch, val_one_epoch
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
+import torch.cuda.nccl as nccl
+from distutils.version import LooseVersion
+
+import torch.distributed as dist
 
 from llama import Tokenizer
+from config import train_config
+import fsdp_policies
+import environment
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    CPUOffload,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
+)
+
+
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
+
 
 PROMPT_DICT = {
     "prompt_input": (
@@ -145,21 +169,52 @@ def get_args_parser():
 
     return parser
 
+bf16_ready = (
+    torch.version.cuda
+    and torch.cuda.is_bf16_supported() 
+    and LooseVersion(torch.version.cuda) >= "11.0"
+    and dist.is_nccl_available()
+    and nccl.version() >= (2, 10)
+)
+
+def get_fsdp_policies(cfg):
+
+    """establish current policies for mixed precision and fsdp wrapping"""
+
+    mixed_precision_policy = None
+    wrapping_policy = None
+
+    # mixed precision -----
+    if cfg.use_mixed_precision:
+        bf16_ready = environment.verify_bfloat_support
+
+        if bf16_ready:
+            mixed_precision_policy = fsdp_policies.bfSixteen
+            print(f"bFloat16 enabled for mixed precision - using bfSixteen policy")
+        else:
+            # mixed_precision_policy = policies.fpSixteen
+            print(f"bFloat16 support not present. Not using for mixed precision")
+
+    wrapping_policy = fsdp_policies.get_tranformer_wrapper()
+    # wrapping_policy = policies. get_size_policy(10e8)
+
+    return mixed_precision_policy, wrapping_policy
 
 def main(args):
 
     misc.init_distributed_mode(args)
-
+    fsdp_config = train_config()
     print("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(", ", ",\n"))
 
     device = torch.device(args.device)
-
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     # fix the seed for reproducibility
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
-
     cudnn.benchmark = True
 
     dataset_train = InstructionDataset(
@@ -213,11 +268,12 @@ def main(args):
 
     # define the model
     model = models_llama_adapter.__dict__[args.model](args)
-
-    model.to(device)
+    for name, param in model.named_parameters():
+        print("************",name, param.dtype)
+    # model.to(device)
 
     model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
+    # print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
 
@@ -231,8 +287,22 @@ def main(args):
     print("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        # settin pfsdp policies
+        model_sharding_strategy = (
+        fsdp_config.sharding_strategy or ShardingStrategy.FULL_SHARD
+        )
+        
+        # model_without_ddp = model.module
+        mp_policy, wrapping_policy = get_fsdp_policies(fsdp_config)
+        model = FSDP(
+        model,
+        auto_wrap_policy=wrapping_policy,
+        mixed_precision=mp_policy,
+        sharding_strategy=model_sharding_strategy,
+        device_id=torch.cuda.current_device(),  # streaming init
+        # use_orig_params=True,
+        )
 
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.param_groups_weight_decay(model_without_ddp, args.weight_decay)
@@ -259,14 +329,21 @@ def main(args):
         )
 
         if args.output_dir and (epoch % 8 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args,
-                model=model,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                loss_scaler=loss_scaler,
-                epoch=epoch,
-            )
+            # misc.save_model(
+            #     args=args,
+            #     model=model,
+            #     model_without_ddp=model_without_ddp,
+            #     optimizer=optimizer,
+            #     loss_scaler=loss_scaler,
+            #     epoch=epoch,
+            # )
+            if fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
+                model_checkpointing.save_model_checkpoint(
+                    model, optimizer, rank, fsdp_config, epoch=1
+                )
+            
+            elif fsdp_config.checkpoint_type == StateDictType.SHARDED_STATE_DICT:
+                model_checkpointing.save_model_sharded(model, rank, fsdp_config)
 
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
